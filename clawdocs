@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""clawdocs — Fetch OpenClaw docs as markdown. Optimized for LLM agent consumption.
+
+One call from topic → full page content. No LLM required, pure HTTP.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+DOCS_ROOT = "https://docs.openclaw.ai"
+TRUSTED_HOST = "docs.openclaw.ai"
+UA = f"clawdocs/{VERSION}"
+
+EXIT_OK = 0
+EXIT_NOT_FOUND = 1
+EXIT_NETWORK = 2
+EXIT_AMBIGUOUS = 3
+EXIT_USAGE = 4
+
+# ── Color ──────────────────────────────────────────────────────────────────────
+
+_NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+
+def _c(text: str, code: str) -> str:
+    return text if _NO_COLOR else f"\x1b[{code}m{text}\x1b[0m"
+
+
+def eprint(*args, quiet: bool = False) -> None:
+    if not quiet:
+        print(*args, file=sys.stderr)
+
+
+# ── Index ──────────────────────────────────────────────────────────────────────
+
+_INDEX_CANDIDATES: list[Path] = [
+    Path.home() / ".openclaw/workspace/skills/docclaw/references/openclaw-docs-index.json",
+    Path.home() / ".openclaw/lib/node_modules/openclaw/docs/index.json",
+]
+
+
+def _find_index(override: str | None) -> Path | None:
+    if override:
+        p = Path(override)
+        return p if p.exists() else None
+    env = os.environ.get("CLAWDOCS_INDEX")
+    if env:
+        p = Path(env)
+        return p if p.exists() else None
+    for p in _INDEX_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_index(path: Path | None) -> list[dict]:
+    if not path:
+        return []
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        return [e for e in data.get("entries", []) if isinstance(e, dict)]
+    except Exception:
+        return []
+
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+
+def _strip_ansi(s: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def _make_md_url(slug: str) -> str:
+    slug = slug.strip("/").removesuffix(".md")
+    return f"{DOCS_ROOT}/{slug}.md"
+
+
+def _cache_path(slug: str) -> Path:
+    base = Path(
+        os.environ.get("CLAWDOCS_CACHE_DIR", str(Path.home() / ".cache/clawdocs"))
+    )
+    safe = slug.strip("/").replace("/", os.sep)
+    return base / f"{safe}.md"
+
+
+def _extract_headings(md: str, limit: int = 7) -> list[str]:
+    """Pull H1/H2 headings from markdown for the 'covers' field."""
+    out: list[str] = []
+    for line in md.splitlines():
+        m = re.match(r"^#{1,2}\s+(.+)", line)
+        if m:
+            out.append(m.group(1).strip())
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _related_slugs(slug: str, entries: list[dict], limit: int = 5) -> list[str]:
+    """Find index entries sharing the same top-level section."""
+    prefix = slug.split("/")[0]
+    return [
+        str(e["path"])
+        for e in entries
+        if str(e.get("path", "")).startswith(prefix) and e.get("path") != slug
+    ][:limit]
+
+
+# ── Resolution chain ───────────────────────────────────────────────────────────
+
+def _resolve(
+    query: str,
+    entries: list[dict],
+    top_n: int = 1,
+    quiet: bool = False,
+) -> tuple[str, str, str]:
+    """Return (slug, confidence, method) or ('', '', 'no match')."""
+    q = query.strip().strip("/").removesuffix(".md")
+    q_lower = q.lower()
+
+    # 1. Exact index path match (no network)
+    for e in entries:
+        if e.get("path") == q:
+            eprint(f"→ index exact: {q}", quiet=quiet)
+            return q, "exact", "index exact path"
+
+    # 2. Path suffix / title match (no network)
+    hits: list[tuple[str, str, str]] = []
+    for e in entries:
+        p = str(e.get("path", ""))
+        title = str(e.get("title", "")).lower()
+        if p.endswith("/" + q_lower) or p == q_lower:
+            hits.append((p, "high", "index path suffix"))
+        elif q_lower in title:
+            hits.append((p, "high", "index title match"))
+    if hits:
+        slug, conf, method = hits[min(top_n - 1, len(hits) - 1)]
+        eprint(f"→ {method}: {slug}", quiet=quiet)
+        return slug, conf, method
+
+    # 3. Semantic search via `openclaw docs` (one network call)
+    eprint(f'→ semantic search: openclaw docs "{q}"', quiet=quiet)
+    sr = _run_search(q)
+    if sr:
+        idx = min(top_n - 1, len(sr) - 1)
+        slug, _, _ = sr[idx]
+        eprint(f"→ semantic result #{idx + 1}: {slug}", quiet=quiet)
+        return slug, "medium", f"semantic search #{idx + 1}"
+
+    # 4. Fuzzy difflib fallback (no network)
+    universe = [str(e.get("path", "")) for e in entries if e.get("path")]
+    universe += [str(e.get("title", "")).lower() for e in entries if e.get("title")]
+    matches = difflib.get_close_matches(q_lower, universe, n=5, cutoff=0.5)
+    if matches:
+        hit = matches[min(top_n - 1, len(matches) - 1)]
+        # Map title match back to its slug
+        slug = hit if "/" in hit else next(
+            (str(e.get("path", "")) for e in entries
+             if str(e.get("title", "")).lower() == hit),
+            hit,
+        )
+        score = round(difflib.SequenceMatcher(None, q_lower, hit).ratio(), 2)
+        eprint(f"→ fuzzy: {slug} (score {score})", quiet=quiet)
+        return slug, "low", f"fuzzy match (score {score})"
+
+    return "", "", "no match"
+
+
+def _run_search(query: str) -> list[tuple[str, str, str]]:
+    """Run `openclaw docs <query>`, return list of (slug, url, excerpt)."""
+    try:
+        r = subprocess.run(
+            ["openclaw", "docs", query],
+            capture_output=True, text=True, timeout=15,
+        )
+        raw = _strip_ansi(r.stdout + r.stderr)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    pattern = re.compile(
+        r"-\s+\[.*?\]\((https://docs\.openclaw\.ai/([^)]+))\)\s*(?:-\s*(.*))?$"
+    )
+    results: list[tuple[str, str, str]] = []
+    for line in raw.splitlines():
+        m = pattern.match(line.strip())
+        if m:
+            results.append((m.group(2).strip("/"), m.group(1), (m.group(3) or "").strip()))
+    return results
+
+
+# ── Fetch ──────────────────────────────────────────────────────────────────────
+
+def _fetch_page(slug: str, timeout: float, no_cache: bool) -> tuple[str, bool]:
+    """Return (markdown_content, was_cached). Raises on network failure."""
+    cp = _cache_path(slug)
+    if not no_cache and cp.exists():
+        return cp.read_text("utf-8"), True
+
+    url = _make_md_url(slug)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        md = resp.read().decode("utf-8", errors="replace")
+
+    if "<html" in md[:500].lower():
+        raise ValueError(f"Got HTML instead of markdown from {url}. Slug may be wrong.")
+
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    cp.write_text(md, "utf-8")
+    return md, False
+
+
+# ── Output formatting ──────────────────────────────────────────────────────────
+
+def _fmt_plain(
+    slug: str, content: str, confidence: str, method: str,
+    related: list[str], covers: list[str], cached: bool,
+    no_header: bool, plain: bool,
+) -> str:
+    if no_header:
+        return content
+
+    url = f"{DOCS_ROOT}/{slug}"
+    cache_tag = " (cached)" if cached else ""
+    header_lines = [
+        f"--- clawdocs: {slug} ---",
+        f"url: {url}",
+        f"confidence: {confidence} ({method}){cache_tag}",
+    ]
+    if related:
+        header_lines.append(f"related: {', '.join(related)}")
+    non_title = covers[1:] if len(covers) > 1 else []
+    if non_title:
+        header_lines.append(f"covers: {', '.join(non_title)}")
+
+    if plain:
+        header = "\n".join(header_lines)
+        footer = f"--- end: {slug} ---"
+    else:
+        header = "\n".join(
+            _c(l, "36") if i == 0 else l
+            for i, l in enumerate(header_lines)
+        )
+        footer = _c(f"--- end: {slug} ---", "36")
+
+    return f"{header}\n\n{content}\n\n{footer}"
+
+
+def _fmt_json(
+    slug: str, content: str, confidence: str, method: str,
+    related: list[str], covers: list[str], cached: bool,
+) -> str:
+    return json.dumps({
+        "slug": slug,
+        "url": f"{DOCS_ROOT}/{slug}",
+        "title": covers[0] if covers else slug.split("/")[-1],
+        "confidence": confidence,
+        "match_method": method,
+        "covers": covers[1:] if len(covers) > 1 else [],
+        "related": related,
+        "content": content,
+        "cached": cached,
+        "fetched_at": datetime.datetime.utcnow().isoformat() + "Z",
+    }, indent=2)
+
+
+# ── Shared fetch+emit ──────────────────────────────────────────────────────────
+
+def _do_fetch(slug: str, confidence: str, method: str, args: argparse.Namespace) -> int:
+    entries: list[dict] = args._entries
+    try:
+        content, cached = _fetch_page(slug, args.timeout, args.no_cache)
+        eprint(
+            f"→ {'cache hit' if cached else 'fetched'}: {_make_md_url(slug)}",
+            quiet=args.quiet,
+        )
+    except urllib.error.HTTPError as exc:
+        print(f"Error: failed to fetch {slug} (HTTP {exc.code})", file=sys.stderr)
+        print(f"Retry: clawdocs get {slug} --no-cache", file=sys.stderr)
+        sr = _run_search(slug.split("/")[-1])
+        if sr:
+            print("Related:", file=sys.stderr)
+            for s, _, _ in sr[:3]:
+                print(f"  clawdocs get {s}", file=sys.stderr)
+        return EXIT_NETWORK
+    except urllib.error.URLError as exc:
+        print(f"Error: network error: {exc}", file=sys.stderr)
+        print(f"Offline: clawdocs list --prefix {slug.split('/')[0]}/", file=sys.stderr)
+        return EXIT_NETWORK
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    related = _related_slugs(slug, entries)
+    covers = _extract_headings(content)
+
+    if args.json:
+        out = _fmt_json(slug, content, confidence, method, related, covers, cached)
+    else:
+        out = _fmt_plain(
+            slug, content, confidence, method, related, covers, cached,
+            no_header=args.no_header, plain=args.plain,
+        )
+
+    out_file = getattr(args, "out", None)
+    if out_file:
+        Path(out_file).write_text(out, "utf-8")
+        eprint(f"Written to: {out_file}", quiet=args.quiet)
+    else:
+        print(out)
+
+    return EXIT_OK
+
+
+# ── Subcommand handlers ────────────────────────────────────────────────────────
+
+def handle_fetch(args: argparse.Namespace) -> int:
+    entries: list[dict] = args._entries
+    slug, confidence, method = _resolve(
+        args.topic, entries, top_n=args.top, quiet=args.quiet
+    )
+
+    if not slug:
+        print(f'Error: no match for "{args.topic}"', file=sys.stderr)
+        universe = [str(e.get("path", "")) for e in entries if e.get("path")]
+        suggestions = difflib.get_close_matches(args.topic.lower(), universe, n=3, cutoff=0.4)
+        if suggestions:
+            print("Did you mean?", file=sys.stderr)
+            for s in suggestions:
+                title = next((e.get("title", "") for e in entries if e.get("path") == s), "")
+                print(f"  {s:<44} — {title}", file=sys.stderr)
+        print(f"Run: clawdocs search {args.topic}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if confidence == "low":
+        if args.strict:
+            print(
+                f'Error: low-confidence match "{args.topic}" → {slug} (--strict)',
+                file=sys.stderr,
+            )
+            print(f"Try: clawdocs search {args.topic}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        eprint(
+            f'Warning: low-confidence match "{args.topic}" → {slug} ({method})\n'
+            f'         Verify with: clawdocs search "{args.topic}"',
+            quiet=args.quiet,
+        )
+
+    return _do_fetch(slug, confidence, method, args)
+
+
+def handle_get(args: argparse.Namespace) -> int:
+    slug = args.slug.strip("/").removesuffix(".md")
+    entries: list[dict] = args._entries
+
+    in_index = any(e.get("path") == slug for e in entries)
+    if not in_index:
+        if args.strict:
+            print(f'Error: "{slug}" not found in index (--strict)', file=sys.stderr)
+            return EXIT_NOT_FOUND
+        eprint(f'Warning: "{slug}" not in index; attempting fetch anyway', quiet=args.quiet)
+
+    return _do_fetch(slug, "exact", "direct slug", args)
+
+
+def handle_search(args: argparse.Namespace) -> int:
+    entries: list[dict] = args._entries
+    query = " ".join(args.query)
+
+    results = _run_search(query)
+
+    # Enrich with index title/path matches not already in results
+    q_lower = query.lower()
+    seen = {slug for slug, _, _ in results}
+    for e in entries:
+        p = str(e.get("path", ""))
+        title = str(e.get("title", "")).lower()
+        if p in seen:
+            continue
+        if q_lower in title or p.endswith("/" + q_lower.replace(" ", "-")):
+            results.append((p, f"{DOCS_ROOT}/{p}", e.get("title", "")))
+            seen.add(p)
+
+    results = results[: args.limit]
+
+    if not results:
+        print(f'Error: no results for "{query}"', file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if args.slugs_only:
+        for slug, _, _ in results:
+            print(slug)
+        return EXIT_OK
+
+    if args.json:
+        out = []
+        for slug, url, excerpt in results:
+            e = next((x for x in entries if x.get("path") == slug), {})
+            out.append({
+                "slug": slug,
+                "url": url,
+                "title": e.get("title", ""),
+                "excerpt": excerpt,
+            })
+        print(json.dumps(out, indent=2))
+        return EXIT_OK
+
+    print(f'\nSearch: "{query}"  ({len(results)} matches)\n')
+    for i, (slug, url, excerpt) in enumerate(results, 1):
+        e = next((x for x in entries if x.get("path") == slug), {})
+        title = e.get("title", slug.split("/")[-1])
+        print(f"[{i}] {slug} — {title}")
+        print(f"    {url}")
+        if excerpt:
+            print(f"    {excerpt[:120]}")
+        print()
+    print(f"Fetch a result:  clawdocs get <slug>")
+    print(f"Fetch top result: clawdocs {query}")
+    return EXIT_OK
+
+
+def handle_list(args: argparse.Namespace) -> int:
+    entries: list[dict] = args._entries
+    prefix = args.prefix or ""
+    filtered = [e for e in entries if str(e.get("path", "")).startswith(prefix)]
+
+    if not filtered:
+        print(f'Error: no entries with prefix "{prefix}"', file=sys.stderr)
+        return EXIT_NOT_FOUND
+
+    if args.json:
+        print(json.dumps(
+            [{"slug": e.get("path"), "title": e.get("title")} for e in filtered],
+            indent=2,
+        ))
+        return EXIT_OK
+
+    for e in filtered:
+        slug = str(e.get("path", ""))
+        if args.slugs_only or args.plain:
+            print(slug)
+        else:
+            print(f"{slug:<54} {e.get('title', '')}")
+    return EXIT_OK
+
+
+# ── Argparse ───────────────────────────────────────────────────────────────────
+
+def _add_shared_flags(p: argparse.ArgumentParser) -> None:
+    """Global flags that apply to every subcommand."""
+    p.add_argument("--json", action="store_true", help="JSON output to stdout")
+    p.add_argument("--plain", action="store_true", help="Plain text, no ANSI")
+    p.add_argument(
+        "--no-header", action="store_true", dest="no_header",
+        help="Content only — omit --- clawdocs: slug --- wrapper",
+    )
+    p.add_argument(
+        "--no-color", action="store_true", dest="no_color",
+        help="Disable ANSI colors (also: set NO_COLOR env var)",
+    )
+    p.add_argument("-q", "--quiet", action="store_true", help="Suppress stderr diagnostics")
+    p.add_argument(
+        "--timeout", type=float,
+        default=float(os.environ.get("CLAWDOCS_TIMEOUT", "20")),
+        metavar="S", help="HTTP timeout in seconds (default: 20)",
+    )
+    p.add_argument("--index", metavar="PATH", help="Override index JSON (or set CLAWDOCS_INDEX)")
+    p.add_argument("--no-cache", action="store_true", dest="no_cache", help="Bypass local cache")
+    p.add_argument(
+        "--strict", action="store_true",
+        help="Fail on low-confidence matches or slugs not in index",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="clawdocs",
+        description=(
+            "Fetch OpenClaw docs as markdown — agent-first.\n"
+            "One call from topic → full page content. Pure HTTP, no LLM required."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  clawdocs telegram                  # smart fetch → markdown to stdout
+  clawdocs telegram --no-header -q   # clean content only (embed in context)
+  clawdocs telegram --json           # structured JSON output
+  clawdocs get channels/telegram     # direct slug, no search
+  clawdocs search cron --slugs-only  # list matching slugs (pipe-friendly)
+  clawdocs telegram --top 2          # use 2nd search result
+  clawdocs list --prefix channels/   # enumerate a section
+  clawdocs get channels/telegram --no-header | grep "dmPolicy"
+""",
+    )
+    root.add_argument("--version", action="version", version=f"clawdocs {VERSION}")
+
+    sub = root.add_subparsers(dest="cmd", metavar="subcommand")
+
+    # ── fetch (default, injected when first positional is not a known subcommand)
+    p_fetch = sub.add_parser(
+        "fetch", help="Smart fetch: search → auto-pick best match → markdown to stdout",
+    )
+    p_fetch.add_argument("topic", help="Topic keyword, slug (channels/telegram), or partial title")
+    p_fetch.add_argument(
+        "--top", type=int, default=1, metavar="N",
+        help="Use Nth search result instead of 1st (default: 1)",
+    )
+    p_fetch.add_argument("--out", metavar="FILE", help="Write content to file instead of stdout")
+    _add_shared_flags(p_fetch)
+
+    # ── get
+    p_get = sub.add_parser("get", help="Direct fetch by exact slug — no search")
+    p_get.add_argument("slug", help="Doc slug, e.g. channels/telegram")
+    p_get.add_argument("--out", metavar="FILE", help="Write content to file instead of stdout")
+    _add_shared_flags(p_get)
+
+    # ── search
+    p_search = sub.add_parser("search", help="Search only — return ranked match list")
+    p_search.add_argument("query", nargs="+", help="Search query")
+    p_search.add_argument("--limit", type=int, default=10, metavar="N", help="Max results (default: 10)")
+    p_search.add_argument(
+        "--slugs-only", action="store_true", dest="slugs_only",
+        help="Output one slug per line — maximally agent-friendly",
+    )
+    _add_shared_flags(p_search)
+
+    # ── list
+    p_list = sub.add_parser("list", help="List all known slugs from offline index")
+    p_list.add_argument("--prefix", metavar="P", help="Filter by slug prefix, e.g. channels/")
+    p_list.add_argument(
+        "--slugs-only", action="store_true", dest="slugs_only",
+        help="Output slugs only, one per line",
+    )
+    _add_shared_flags(p_list)
+
+    return root
+
+
+KNOWN_SUBCOMMANDS = {"fetch", "get", "search", "list"}
+
+
+def main() -> int:
+    global _NO_COLOR
+
+    # Pre-process argv: inject "fetch" when first positional is not a known subcommand.
+    # This makes `clawdocs telegram` behave as `clawdocs fetch telegram`.
+    raw = sys.argv[1:]
+    first_pos = next((a for a in raw if not a.startswith("-")), None)
+    if first_pos and first_pos not in KNOWN_SUBCOMMANDS:
+        idx = raw.index(first_pos)
+        raw = raw[:idx] + ["fetch"] + raw[idx:]
+
+    parser = build_parser()
+    args = parser.parse_args(raw)
+
+    if not args.cmd:
+        parser.print_help()
+        return EXIT_USAGE
+
+    # Apply color suppression
+    if getattr(args, "no_color", False):
+        _NO_COLOR = True
+
+    # Load index and attach to namespace for all handlers
+    index_path = _find_index(getattr(args, "index", None))
+    entries = _load_index(index_path)
+    if not entries:
+        eprint(
+            "Warning: index not loaded — install docclaw skill or set CLAWDOCS_INDEX",
+            quiet=getattr(args, "quiet", False),
+        )
+    args._entries = entries
+
+    dispatch = {
+        "fetch": handle_fetch,
+        "get": handle_get,
+        "search": handle_search,
+        "list": handle_list,
+    }
+    return dispatch[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

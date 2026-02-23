@@ -132,4 +132,14 @@ printf '\n'
 
 check_path "$INSTALL_DIR"
 
-printf '\nRun: clawdocs --version\n\n'
+# ── build local docs index ─────────────────────────────────────────────────────
+
+printf '\nBuilding docs index...\n\n'
+if "$INSTALL_DIR/$BINARY" update; then
+    printf '\n'
+else
+    warn "Index build failed (network issue?). Run later: clawdocs update"
+    printf '\n'
+fi
+
+printf 'Ready. Try: clawdocs telegram\n\n'

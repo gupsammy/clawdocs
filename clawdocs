@@ -16,9 +16,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DOCS_ROOT = "https://docs.openclaw.ai"
 TRUSTED_HOST = "docs.openclaw.ai"
 UA = f"clawdocs/{VERSION}"
@@ -45,10 +46,10 @@ def eprint(*args, quiet: bool = False) -> None:
 
 # ── Index ──────────────────────────────────────────────────────────────────────
 
-_INDEX_CANDIDATES: list[Path] = [
-    Path.home() / ".openclaw/workspace/skills/docclaw/references/openclaw-docs-index.json",
-    Path.home() / ".openclaw/lib/node_modules/openclaw/docs/index.json",
-]
+def _data_dir() -> Path:
+    return Path(
+        os.environ.get("CLAWDOCS_DATA_DIR", str(Path.home() / ".local/share/clawdocs"))
+    )
 
 
 def _find_index(override: str | None) -> Path | None:
@@ -59,18 +60,41 @@ def _find_index(override: str | None) -> Path | None:
     if env:
         p = Path(env)
         return p if p.exists() else None
-    for p in _INDEX_CANDIDATES:
+    candidates = [
+        _data_dir() / "index.json",  # clawdocs-native; populate with: clawdocs update
+        Path.home() / ".openclaw/workspace/skills/docclaw/references/openclaw-docs-index.json",
+        Path.home() / ".openclaw/lib/node_modules/openclaw/docs/index.json",
+    ]
+    for p in candidates:
         if p.exists():
             return p
     return None
 
 
-def _load_index(path: Path | None) -> list[dict]:
+_STALE_DAYS = 14
+
+
+def _load_index(path: Path | None, quiet: bool = False) -> list[dict]:
     if not path:
         return []
     try:
         data = json.loads(path.read_text("utf-8"))
-        return [e for e in data.get("entries", []) if isinstance(e, dict)]
+        entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
+        gen = data.get("generated_at", "")
+        if gen:
+            try:
+                age = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    - datetime.datetime.fromisoformat(gen)
+                )
+                if age.days > _STALE_DAYS:
+                    eprint(
+                        f"Warning: index is {age.days} days old — run: clawdocs update",
+                        quiet=quiet,
+                    )
+            except Exception:
+                pass
+        return entries
     except Exception:
         return []
 
@@ -470,6 +494,147 @@ def handle_list(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ── Index build (for `clawdocs update`) ───────────────────────────────────────
+
+_LLMS_BULLET_RE = re.compile(
+    r"^\s*-\s+\[(?P<title>[^\]]+)\]\((?P<url>https://docs\.openclaw\.ai/[^)]+)\)(?::\s*(?P<desc>.*))?$"
+)
+
+
+def _normalize_doc_url(url: str) -> tuple[str, str, str, str]:
+    """Return (markdown_url, html_url, path, section)."""
+    url = url.strip()
+    if url.endswith(".md"):
+        html_url, md_url = url[:-3], url
+    else:
+        html_url, md_url = url, url + ".md"
+    path = html_url.replace(DOCS_ROOT + "/", "").lstrip("/") or "index"
+    section = path.split("/", 1)[0]
+    return md_url, html_url, path, section
+
+
+def _build_index(timeout: float) -> dict:
+    """Fetch llms.txt + sitemap.xml and build a merged docs index."""
+    llms_url = f"{DOCS_ROOT}/llms.txt"
+    sitemap_url = f"{DOCS_ROOT}/sitemap.xml"
+
+    def http_get(url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    llms_text = http_get(llms_url)
+    llms_entries: list[dict] = []
+    for line in llms_text.splitlines():
+        m = _LLMS_BULLET_RE.match(line.strip())
+        if not m:
+            continue
+        title = m.group("title").strip()
+        url = m.group("url").strip()
+        desc = (m.group("desc") or "").strip()
+        md_url, html_url, path, section = _normalize_doc_url(url)
+        llms_entries.append({
+            "title": title, "description": desc,
+            "markdown_url": md_url, "html_url": html_url,
+            "path": path, "section": section, "source": "llms",
+        })
+
+    sitemap_text = http_get(sitemap_url)
+    sitemap_map: dict[str, str] = {}
+    try:
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        root_el = ET.fromstring(sitemap_text)
+        for url_el in root_el.findall("sm:url", ns):
+            loc_el = url_el.find("sm:loc", ns)
+            mod_el = url_el.find("sm:lastmod", ns)
+            if loc_el is None or not loc_el.text:
+                continue
+            sitemap_map[loc_el.text.strip()] = (
+                (mod_el.text or "").strip() if mod_el is not None else ""
+            )
+    except ET.ParseError:
+        pass  # sitemap is a bonus; partial failure is ok
+
+    dedup: dict[str, dict] = {}
+    for item in llms_entries:
+        key = item["path"]
+        if key in dedup:
+            continue
+        item["lastmod"] = (
+            sitemap_map.get(item["html_url"], "") or sitemap_map.get(item["markdown_url"], "")
+        )
+        dedup[key] = item
+
+    for loc, lastmod in sitemap_map.items():
+        if not loc.startswith(DOCS_ROOT):
+            continue
+        md_url, html_url, path, section = _normalize_doc_url(loc)
+        if path in dedup:
+            continue
+        leaf = (path.split("/")[-1] or "index").replace("-", " ").replace("_", " ").title()
+        dedup[path] = {
+            "title": leaf, "description": "",
+            "markdown_url": md_url, "html_url": html_url,
+            "path": path, "section": section, "source": "sitemap", "lastmod": lastmod,
+        }
+
+    entries = sorted(dedup.values(), key=lambda x: x["path"])
+    return {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "docs_root": DOCS_ROOT,
+        "sources": {"llms": llms_url, "sitemap": sitemap_url},
+        "stats": {
+            "llms_entries": len(llms_entries),
+            "sitemap_entries": len(sitemap_map),
+            "indexed_entries": len(entries),
+        },
+        "entries": entries,
+    }
+
+
+def handle_update(args: argparse.Namespace) -> int:
+    out_path = _data_dir() / "index.json"
+    eprint("→ fetching llms.txt ...", quiet=args.quiet)
+    eprint("→ fetching sitemap.xml ...", quiet=args.quiet)
+    try:
+        payload = _build_index(args.timeout)
+    except urllib.error.URLError as exc:
+        print(f"Error: network error: {exc}", file=sys.stderr)
+        return EXIT_NETWORK
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_NETWORK
+
+    n = payload["stats"]["indexed_entries"]
+    eprint(f"→ merged {n} entries", quiet=args.quiet)
+
+    if getattr(args, "dry_run", False):
+        if args.json:
+            print(json.dumps({
+                "dry_run": True,
+                "entries_would_write": n,
+                "index_path": str(out_path),
+                "generated_at": payload["generated_at"],
+            }, indent=2))
+        else:
+            print(f"Dry run: would write {n} entries to {out_path}")
+        return EXIT_OK
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8")
+
+    if args.json:
+        print(json.dumps({
+            "entries_written": n,
+            "index_path": str(out_path),
+            "generated_at": payload["generated_at"],
+        }, indent=2))
+    else:
+        print(f"✓ index written: {out_path}")
+        print("Run: clawdocs list")
+    return EXIT_OK
+
+
 # ── Argparse ───────────────────────────────────────────────────────────────────
 
 def _add_shared_flags(p: argparse.ArgumentParser) -> None:
@@ -559,10 +724,20 @@ examples:
     )
     _add_shared_flags(p_list)
 
+    # ── update
+    p_update = sub.add_parser(
+        "update", help="Refresh local docs index from docs.openclaw.ai",
+    )
+    p_update.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="Show what would be written without writing",
+    )
+    _add_shared_flags(p_update)
+
     return root
 
 
-KNOWN_SUBCOMMANDS = {"fetch", "get", "search", "list"}
+KNOWN_SUBCOMMANDS = {"fetch", "get", "search", "list", "update"}
 
 
 def main() -> int:
@@ -589,11 +764,12 @@ def main() -> int:
 
     # Load index and attach to namespace for all handlers
     index_path = _find_index(getattr(args, "index", None))
-    entries = _load_index(index_path)
-    if not entries:
+    quiet = getattr(args, "quiet", False)
+    entries = _load_index(index_path, quiet=quiet)
+    if not entries and args.cmd != "update":
         eprint(
-            "Warning: index not loaded — install docclaw skill or set CLAWDOCS_INDEX",
-            quiet=getattr(args, "quiet", False),
+            "Warning: index not loaded — run: clawdocs update",
+            quiet=quiet,
         )
     args._entries = entries
 
@@ -602,6 +778,7 @@ def main() -> int:
         "get": handle_get,
         "search": handle_search,
         "list": handle_list,
+        "update": handle_update,
     }
     return dispatch[args.cmd](args)
 

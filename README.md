@@ -4,6 +4,7 @@
 <p>Fetch OpenClaw docs as markdown — agent-first.<br>One call from topic → full page content. Pure HTTP, no LLM required.</p>
 
 ![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+[![GitHub Release](https://img.shields.io/github/v/release/gupsammy/clawdocs?style=flat-square)](https://github.com/gupsammy/clawdocs/releases/latest)
 
 </div>
 
@@ -50,6 +51,8 @@ chmod +x ~/.local/bin/clawdocs
 ```bash
 CLAWDOCS_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
 ```
+
+Browse all releases at [github.com/gupsammy/clawdocs/releases](https://github.com/gupsammy/clawdocs/releases).
 
 ### Usage
 

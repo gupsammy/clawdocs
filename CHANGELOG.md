@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-23
+
+### Added
+- Add `clawdocs update` subcommand — fetches `llms.txt` and `sitemap.xml` from
+  `docs.openclaw.ai` and writes a merged index to `~/.local/share/clawdocs/index.json`
+- Install script now runs `clawdocs update` automatically on first install
+- Warn on stderr when the local index is older than 14 days (run `clawdocs update`)
+- Index resolution now checks the clawdocs-native data dir first, eliminating the
+  hard dependency on the docclaw skill
+
 ## [0.1.0] - 2026-02-23
 
 ### Added

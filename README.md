@@ -19,6 +19,7 @@
 - **Zero dependencies** — pure Python standard library, no `pip install` step
 - **Structured JSON output** — slug, url, title, confidence, match method, related slugs, section headings, and full content in one object
 - **Local cache** — fetched pages cached at `~/.cache/clawdocs/` for instant re-reads
+- **Self-contained index** — `clawdocs update` fetches and builds the local index from `docs.openclaw.ai`; no external skill required
 - **Offline-friendly** — index-based lookups (steps 1, 2, 4) work without network access; degrades gracefully when index is absent
 - **Agent-optimized output** — `--no-header -q` strips all wrapper text, leaving clean markdown ready to embed in context windows
 
@@ -49,7 +50,7 @@ chmod +x ~/.local/bin/clawdocs
 **Pin to a specific version:**
 
 ```bash
-CLAWDOCS_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
+CLAWDOCS_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
 ```
 
 Browse all releases at [github.com/gupsammy/clawdocs/releases](https://github.com/gupsammy/clawdocs/releases).
@@ -57,6 +58,9 @@ Browse all releases at [github.com/gupsammy/clawdocs/releases](https://github.co
 ### Usage
 
 ```bash
+# First-time setup — build local docs index (no external tool needed)
+clawdocs update
+
 # Smart fetch — keyword, partial title, or exact slug
 clawdocs telegram
 
@@ -102,10 +106,13 @@ covers: Bot setup, Webhook configuration, Message types
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CLAWDOCS_INDEX` | `~/.openclaw/workspace/skills/docclaw/references/openclaw-docs-index.json` | Path to the local docs index JSON |
+| `CLAWDOCS_INDEX` | (auto-resolve) | Override index JSON path directly |
+| `CLAWDOCS_DATA_DIR` | `~/.local/share/clawdocs` | Where `clawdocs update` writes `index.json` |
 | `CLAWDOCS_CACHE_DIR` | `~/.cache/clawdocs` | Directory for cached markdown pages |
 | `CLAWDOCS_TIMEOUT` | `20` | HTTP fetch timeout in seconds |
 | `NO_COLOR` | unset | Set to any value to disable ANSI color output |
+
+Index resolution order (first found wins): `CLAWDOCS_INDEX` env → `$CLAWDOCS_DATA_DIR/index.json` → docclaw skill path → openclaw node path.
 
 ### Flags (all subcommands)
 
@@ -122,6 +129,7 @@ covers: Bot setup, Webhook configuration, Message types
 | `--index PATH` | Override index file path (or use `CLAWDOCS_INDEX`) |
 | `--out FILE` | Write output to a file instead of stdout |
 | `--top N` | Use the Nth search result instead of the 1st (fetch/search only) |
+| `--dry-run` | Show what `update` would write without writing it |
 
 ### Exit codes
 
@@ -138,7 +146,6 @@ covers: Bot setup, Webhook configuration, Message types
 - [ ] `--watch` mode — poll for doc updates and re-fetch on change
 - [ ] Multi-slug batch fetch in a single call
 - [ ] Shell completions for bash and zsh
-- [ ] `clawdocs update-index` command to refresh the local index without reinstalling docclaw
 - [ ] MCP server mode — expose `clawdocs` as an MCP tool for Claude Desktop and other MCP clients
 
 ## ❓ FAQ
@@ -149,7 +156,7 @@ Only for the semantic search step (step 3 of the resolution chain). If `openclaw
 
 ### How do I get the local docs index?
 
-The index ships with the [docclaw skill](https://openclaw.ai). Installing docclaw places the index at `~/.openclaw/workspace/skills/docclaw/references/openclaw-docs-index.json`, which `clawdocs` looks for automatically. You can point to any compatible index via the `CLAWDOCS_INDEX` environment variable.
+Run `clawdocs update`. It fetches `llms.txt` and `sitemap.xml` from `docs.openclaw.ai` and writes a merged index to `~/.local/share/clawdocs/index.json`. The install script does this automatically on first install. If your index is more than 14 days old, `clawdocs` will remind you to refresh it. You can also point to any compatible index file via `CLAWDOCS_INDEX`.
 
 ### Can I use clawdocs inside an LLM agent tool call?
 

@@ -81,6 +81,15 @@ def _strip_ansi(s: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
+def _reject_if_url(slug: str) -> None:
+    """Reject full URLs passed as slugs — they indicate user confusion."""
+    if slug.startswith("http://") or slug.startswith("https://"):
+        raise ValueError(
+            f"Pass a slug like 'channels/telegram', not a full URL.\n"
+            f"Got: {slug}"
+        )
+
+
 def _make_md_url(slug: str) -> str:
     slug = slug.strip("/").removesuffix(".md")
     return f"{DOCS_ROOT}/{slug}.md"
@@ -89,9 +98,13 @@ def _make_md_url(slug: str) -> str:
 def _cache_path(slug: str) -> Path:
     base = Path(
         os.environ.get("CLAWDOCS_CACHE_DIR", str(Path.home() / ".cache/clawdocs"))
-    )
+    ).resolve()
     safe = slug.strip("/").replace("/", os.sep)
-    return base / f"{safe}.md"
+    candidate = (base / f"{safe}.md").resolve()
+    # Guard: ensure resolved path stays within the cache base directory
+    if not str(candidate).startswith(str(base)):
+        raise ValueError(f"Slug '{slug}' resolves outside cache directory — rejected")
+    return candidate
 
 
 def _extract_headings(md: str, limit: int = 7) -> list[str]:
@@ -358,6 +371,11 @@ def handle_fetch(args: argparse.Namespace) -> int:
 
 
 def handle_get(args: argparse.Namespace) -> int:
+    try:
+        _reject_if_url(args.slug)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     slug = args.slug.strip("/").removesuffix(".md")
     entries: list[dict] = args._entries
 

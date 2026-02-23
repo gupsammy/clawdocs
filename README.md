@@ -21,18 +21,34 @@
 - **Offline-friendly** — index-based lookups (steps 1, 2, 4) work without network access; degrades gracefully when index is absent
 - **Agent-optimized output** — `--no-header -q` strips all wrapper text, leaving clean markdown ready to embed in context windows
 
-## 🚀 Quick Start
+## 🚀 Install
 
 **Prerequisites:** Python 3.8+ (no packages needed).
 
-```bash
-# Clone and make executable
-git clone https://github.com/gupsammy/clawdocs.git
-cd clawdocs
-chmod +x clawdocs
+**One-line install (macOS / Linux):**
 
-# Optional: symlink onto PATH
-ln -s "$PWD/clawdocs" /usr/local/bin/clawdocs
+```bash
+curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/clawdocs`. Override the directory with `INSTALL_DIR`:
+
+```bash
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
+```
+
+**Manual one-liner (no install script):**
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/clawdocs -o ~/.local/bin/clawdocs
+chmod +x ~/.local/bin/clawdocs
+```
+
+**Pin to a specific version:**
+
+```bash
+CLAWDOCS_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/gupsammy/clawdocs/main/install.sh | sh
 ```
 
 ### Usage
